@@ -57,6 +57,13 @@ type fakeFolder struct {
 	FolderID       string
 	Name           string
 	ParentFolderID string
+	// AlsoEmitMediaID mirrors production IMA listings that put the same
+	// folder_* value into media_id alongside folder_id. When true, the list
+	// payload includes both fields (the bug that previously skipped recursion).
+	AlsoEmitMediaID bool
+	// MediaIDOnly emits only media_id/title (no folder_id), as seen when IMA
+	// surfaces folders as knowledge-shaped rows with a folder_* media_id.
+	MediaIDOnly bool
 }
 
 // fakeIMA is an in-process stand-in for the IMA OpenAPI. Only the endpoints
@@ -195,11 +202,28 @@ func (f *fakeIMA) handleAPI(w http.ResponseWriter, r *http.Request) {
 
 		var list []json.RawMessage
 		for _, folder := range folders {
-			b, _ := json.Marshal(folderInfo{
-				FolderID:       folder.FolderID,
-				Name:           folder.Name,
-				ParentFolderID: folder.ParentFolderID,
-			})
+			var b []byte
+			switch {
+			case folder.MediaIDOnly:
+				b, _ = json.Marshal(map[string]interface{}{
+					"media_id":         folder.FolderID,
+					"title":            folder.Name,
+					"parent_folder_id": folder.ParentFolderID,
+				})
+			case folder.AlsoEmitMediaID:
+				b, _ = json.Marshal(map[string]interface{}{
+					"folder_id":        folder.FolderID,
+					"name":             folder.Name,
+					"parent_folder_id": folder.ParentFolderID,
+					"media_id":         folder.FolderID,
+				})
+			default:
+				b, _ = json.Marshal(folderInfo{
+					FolderID:       folder.FolderID,
+					Name:           folder.Name,
+					ParentFolderID: folder.ParentFolderID,
+				})
+			}
 			list = append(list, b)
 		}
 		for _, file := range files {
