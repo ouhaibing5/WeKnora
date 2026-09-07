@@ -158,8 +158,9 @@ type getKnowledgeBaseResp struct {
 
 // knowledgeInfo mirrors IMA's KnowledgeInfo (files, notes, etc.).
 // IMPORTANT: IMA does not expose media_type in the list response, we must call
-// get_media_info to discover it. However, folders are distinguished by presence
-// of a non-empty folder_id — see folderInfo below.
+// get_media_info to discover it. Folders are distinguished by a non-empty
+// folder_id and/or a media_id with the "folder_" prefix — see
+// classifyKnowledgeListEntry.
 type knowledgeInfo struct {
 	MediaID        string `json:"media_id"`
 	Title          string `json:"title"`

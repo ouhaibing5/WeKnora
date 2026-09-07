@@ -363,35 +363,27 @@ func listAllKBFiles(
 				return nil, nil, err
 			}
 			for _, raw := range resp.KnowledgeList {
-				// Probe each entry: an entry with a non-empty folder_id is a
-				// folder; otherwise it's a knowledge item (file / note / etc.).
-				var probe struct {
-					FolderID string `json:"folder_id"`
-					MediaID  string `json:"media_id"`
-				}
-				_ = json.Unmarshal(raw, &probe)
-
-				if probe.FolderID != "" && probe.MediaID == "" {
-					var fi folderInfo
-					if err := json.Unmarshal(raw, &fi); err != nil {
+				folderID, folderName, isFolder := classifyKnowledgeListEntry(raw)
+				if isFolder {
+					if folderID == "" {
 						continue
 					}
 					child := cur.path
 					if child == "" {
-						child = fi.Name
-					} else {
-						child = cur.path + "/" + fi.Name
+						child = folderName
+					} else if folderName != "" {
+						child = cur.path + "/" + folderName
 					}
-					folderPath[fi.FolderID] = child
-					stack = append(stack, todo{folderID: fi.FolderID, path: child})
+					folderPath[folderID] = child
+					stack = append(stack, todo{folderID: folderID, path: child})
 					continue
-				}
-				if probe.MediaID == "" {
-					continue // unrecognized shape, skip defensively
 				}
 				var ki knowledgeInfo
 				if err := json.Unmarshal(raw, &ki); err != nil {
 					continue
+				}
+				if ki.MediaID == "" {
+					continue // unrecognized shape, skip defensively
 				}
 				out = append(out, walkedFile{
 					knowledgeInfo: ki,
@@ -405,6 +397,52 @@ func listAllKBFiles(
 		}
 	}
 	return out, folderPath, nil
+}
+
+// classifyKnowledgeListEntry decides whether a get_knowledge_list entry is a
+// folder that must be recursed into, or a knowledge item to download.
+//
+// IMA's OpenAPI is inconsistent about folder payloads:
+//   - Spec-shaped folders expose folder_id (and often no media_id).
+//   - Production listings frequently also set media_id to the same folder_*
+//     value. The old "folder_id != '' && media_id == ''" check then treated
+//     those folders as files, called get_media_info(folder_*), got 220030,
+//     and never walked into the folder — so KB roots that only contain
+//     folders synced zero documents.
+//
+// Rule: any non-empty folder_id, or a media_id that itself looks like a
+// folder id (prefix "folder_"), is a folder. Prefer folder_id when both are
+// present; fall back to media_id. Name comes from "name", else "title".
+func classifyKnowledgeListEntry(raw json.RawMessage) (folderID, folderName string, isFolder bool) {
+	var probe struct {
+		FolderID string `json:"folder_id"`
+		MediaID  string `json:"media_id"`
+		Name     string `json:"name"`
+		Title    string `json:"title"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return "", "", false
+	}
+
+	switch {
+	case probe.FolderID != "":
+		folderID = probe.FolderID
+		isFolder = true
+	case strings.HasPrefix(probe.MediaID, "folder_"):
+		folderID = probe.MediaID
+		isFolder = true
+	default:
+		return "", "", false
+	}
+
+	folderName = probe.Name
+	if folderName == "" {
+		folderName = probe.Title
+	}
+	if folderName == "" {
+		folderName = folderID
+	}
+	return folderID, folderName, true
 }
 
 // fetchNote resolves an IMA note (media_type=11). Notes carry no downloadable
@@ -480,6 +518,14 @@ func fetchOneMedia(
 	ctx context.Context, cli *client,
 	kbID string, externalID string, f walkedFile, folderPath map[string]string,
 ) (types.FetchedItem, fetchOutcome) {
+	// Defence in depth: folders must never reach get_media_info (IMA returns
+	// 220030). listAllKBFiles should already exclude them.
+	if strings.HasPrefix(f.MediaID, "folder_") {
+		logger.Warnf(ctx, "[IMA] skip folder-shaped media_id %s (title=%q): not a downloadable item",
+			f.MediaID, f.Title)
+		return types.FetchedItem{}, fetchSkipped
+	}
+
 	info, err := cli.GetMediaInfo(ctx, f.MediaID)
 	if err != nil {
 		logger.Warnf(ctx, "[IMA] get_media_info(%s) failed, will retry next sync: %v", f.MediaID, err)

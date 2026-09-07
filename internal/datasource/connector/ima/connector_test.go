@@ -2,6 +2,7 @@ package ima
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -425,6 +426,84 @@ func TestFetchAll_ResolvesFolderPath(t *testing.T) {
 	root := mustFindItem(t, items, logicalKey("kb1", "", "Root"))
 	if root.Metadata["folder_path"] != "" {
 		t.Errorf("root folder_path = %q, want empty", root.Metadata["folder_path"])
+	}
+}
+
+// TestFetchAll_RecursesWhenFolderAlsoHasMediaID covers the production IMA shape
+// where root folders carry media_id=folder_* (previously caused total=N failed=N
+// with get_media_info 220030 and zero documents under those folders).
+func TestFetchAll_RecursesWhenFolderAlsoHasMediaID(t *testing.T) {
+	f := newFakeIMA(t)
+	f.setKB("kb1",
+		[]fakeFile{
+			{MediaID: "m-doc", Title: "Policy", ParentFolderID: "folder_1", MediaType: mediaTypeMarkdown, Body: "# policy"},
+		},
+		fakeFolder{FolderID: "folder_1", Name: "制度", AlsoEmitMediaID: true},
+	)
+
+	items, err := NewConnector().FetchAll(context.Background(), f.config("kb1"), []string{"kb1"})
+	if err != nil {
+		t.Fatalf("FetchAll: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("got %d items, want 1 (folder must be recursed, not downloaded): %s",
+			len(items), describeItems(items))
+	}
+	doc := mustFindItem(t, items, logicalKey("kb1", "folder_1", "Policy"))
+	if doc.Metadata["folder_path"] != "制度" {
+		t.Errorf("folder_path = %q, want 制度", doc.Metadata["folder_path"])
+	}
+	if f.callCount("get_media_info:folder_1") != 0 {
+		t.Errorf("must not call get_media_info on folder ids, got %d", f.callCount("get_media_info:folder_1"))
+	}
+}
+
+// TestFetchAll_RecursesMediaIDOnlyFolders covers listings that expose folders
+// only as media_id=folder_* rows (no folder_id field).
+func TestFetchAll_RecursesMediaIDOnlyFolders(t *testing.T) {
+	f := newFakeIMA(t)
+	f.setKB("kb1",
+		[]fakeFile{
+			{MediaID: "m-doc", Title: "Guide", ParentFolderID: "folder_99", MediaType: mediaTypeMarkdown, Body: "guide"},
+		},
+		fakeFolder{FolderID: "folder_99", Name: "手册", MediaIDOnly: true},
+	)
+
+	items, err := NewConnector().FetchAll(context.Background(), f.config("kb1"), []string{"kb1"})
+	if err != nil {
+		t.Fatalf("FetchAll: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("got %d items, want 1: %s", len(items), describeItems(items))
+	}
+	doc := mustFindItem(t, items, logicalKey("kb1", "folder_99", "Guide"))
+	if doc.Metadata["folder_path"] != "手册" {
+		t.Errorf("folder_path = %q, want 手册", doc.Metadata["folder_path"])
+	}
+}
+
+func TestClassifyKnowledgeListEntry(t *testing.T) {
+	cases := []struct {
+		name           string
+		raw            string
+		wantID         string
+		wantName       string
+		wantIsFolder   bool
+	}{
+		{"spec folder", `{"folder_id":"folder_1","name":"A"}`, "folder_1", "A", true},
+		{"folder + media_id", `{"folder_id":"folder_1","name":"A","media_id":"folder_1"}`, "folder_1", "A", true},
+		{"media_id only folder", `{"media_id":"folder_2","title":"B"}`, "folder_2", "B", true},
+		{"normal file", `{"media_id":"m1","title":"Doc"}`, "", "", false},
+		{"empty", `{}`, "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id, name, isFolder := classifyKnowledgeListEntry(json.RawMessage(tc.raw))
+			if isFolder != tc.wantIsFolder || id != tc.wantID || name != tc.wantName {
+				t.Fatalf("got id=%q name=%q isFolder=%v, want id=%q name=%q isFolder=%v",
+					id, name, isFolder, tc.wantID, tc.wantName, tc.wantIsFolder)
+			}
+		})
 	}
 }
 
