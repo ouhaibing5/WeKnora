@@ -31,6 +31,39 @@ func TestLogicalKey_IsStableAndScoped(t *testing.T) {
 	}
 }
 
+func TestSearchedKnowledgeBaseInfo_UnmarshalProductionWire(t *testing.T) {
+	raw := []byte(`{
+		"kb_id":"kb-shared",
+		"kb_name":"财务部知识库",
+		"cover_url":"https://c",
+		"description":"d",
+		"creator":"alice",
+		"role_type":"普通成员",
+		"base_type":"共享知识库"
+	}`)
+	var got searchedKnowledgeBaseInfo
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.ID != "kb-shared" || got.Name != "财务部知识库" {
+		t.Fatalf("got %+v, want kb_id/kb_name mapped to ID/Name", got)
+	}
+	if got.RoleType != "普通成员" || got.BaseType != "共享知识库" {
+		t.Fatalf("role/base not parsed: %+v", got)
+	}
+}
+
+func TestSearchedKnowledgeBaseInfo_UnmarshalLegacyWire(t *testing.T) {
+	raw := []byte(`{"id":"kb-legacy","name":"Legacy","cover_url":"https://c"}`)
+	var got searchedKnowledgeBaseInfo
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.ID != "kb-legacy" || got.Name != "Legacy" {
+		t.Fatalf("legacy id/name must still parse, got %+v", got)
+	}
+}
+
 // TestLogicalKey_DelimiterIsUnambiguous guards against a key collision from
 // naively concatenating the components.
 func TestLogicalKey_DelimiterIsUnambiguous(t *testing.T) {

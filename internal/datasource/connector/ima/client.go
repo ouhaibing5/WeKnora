@@ -253,11 +253,10 @@ func (c *client) GetKnowledgeBase(ctx context.Context, ids []string) (map[string
 }
 
 // GetAddableKnowledgeBaseList — POST /get_addable_knowledge_base_list.
-// Lists knowledge bases the current token has permission to add content to.
-// This is the authoritative "what KBs can this credential see?" endpoint
-// (see api.md §7). Used as the primary enumeration source in ListResources —
-// search_knowledge_base with empty query has been observed to return an empty
-// list even when the token owns KBs, so we prefer this endpoint.
+// Lists knowledge bases the current token has permission to add content to
+// (see api.md §7). ListResources merges this with search_knowledge_base so
+// shared read-only KBs still appear in the sync picker; this endpoint alone
+// is not a complete "visible KB" list.
 func (c *client) GetAddableKnowledgeBaseList(
 	ctx context.Context, cursor string, limit int,
 ) (*getAddableKnowledgeBaseListResp, error) {

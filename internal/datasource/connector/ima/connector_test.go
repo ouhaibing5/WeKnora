@@ -525,11 +525,15 @@ func TestListResources_ReturnsAddableBases(t *testing.T) {
 	if resources[0].Description != "desc kb-a" {
 		t.Errorf("description not enriched from get_knowledge_base: %q", resources[0].Description)
 	}
+	if resources[0].Metadata["writable"] != true || resources[0].Metadata["shared_readonly"] != false {
+		t.Errorf("owned KB metadata = %+v, want writable=true shared_readonly=false", resources[0].Metadata)
+	}
 }
 
-// TestListResources_FallsBackToSearch covers tenants whose credential exposes
-// read-only scopes, where get_addable_knowledge_base_list comes back empty.
-func TestListResources_FallsBackToSearch(t *testing.T) {
+// TestListResources_SearchOnlySharedBases covers tenants whose credential
+// exposes read-only scopes, where get_addable_knowledge_base_list is empty but
+// search_knowledge_base still returns shared / visible KBs.
+func TestListResources_SearchOnlySharedBases(t *testing.T) {
 	f := newFakeIMA(t)
 	f.searchBases = []searchedKnowledgeBaseInfo{{ID: "kb-x", Name: "X", CoverURL: "https://cover"}}
 
@@ -538,10 +542,62 @@ func TestListResources_FallsBackToSearch(t *testing.T) {
 		t.Fatalf("ListResources: %v", err)
 	}
 	if len(resources) != 1 || resources[0].ExternalID != "kb-x" {
-		t.Fatalf("expected the search fallback to surface kb-x, got %+v", resources)
+		t.Fatalf("expected search to surface kb-x, got %+v", resources)
 	}
 	if resources[0].Metadata["cover_url"] != "https://cover" {
 		t.Errorf("cover_url = %v, want https://cover", resources[0].Metadata["cover_url"])
+	}
+	if resources[0].Metadata["writable"] != false || resources[0].Metadata["shared_readonly"] != true {
+		t.Errorf("shared KB metadata = %+v, want writable=false shared_readonly=true", resources[0].Metadata)
+	}
+}
+
+// TestListResources_MergesAddableAndShared ensures owned (writable) KBs and
+// shared read-only KBs both appear when addable is non-empty — the previous
+// "fallback only when empty" logic hid shared libraries in that case.
+func TestListResources_MergesAddableAndShared(t *testing.T) {
+	f := newFakeIMA(t)
+	f.setKB("kb-own", nil)
+	f.searchBases = []searchedKnowledgeBaseInfo{
+		{ID: "kb-own", Name: "Owned", CoverURL: "https://own", RoleType: "创建者", BaseType: "个人知识库"},
+		{ID: "kb-shared", Name: "Shared", CoverURL: "https://shared", RoleType: "普通成员", BaseType: "共享知识库"},
+	}
+
+	resources, err := NewConnector().ListResources(context.Background(), f.config(), "")
+	if err != nil {
+		t.Fatalf("ListResources: %v", err)
+	}
+	if len(resources) != 2 {
+		t.Fatalf("got %d resources, want 2 (owned+shared deduped): %+v", len(resources), resources)
+	}
+
+	byID := map[string]types.Resource{}
+	for _, r := range resources {
+		byID[r.ExternalID] = r
+	}
+	own, ok := byID["kb-own"]
+	if !ok {
+		t.Fatal("missing owned kb-own")
+	}
+	if own.Metadata["writable"] != true || own.Metadata["shared_readonly"] != false {
+		t.Errorf("kb-own metadata = %+v", own.Metadata)
+	}
+	if own.Metadata["cover_url"] != "https://own" {
+		t.Errorf("kb-own cover_url = %v, want https://own from search merge", own.Metadata["cover_url"])
+	}
+
+	shared, ok := byID["kb-shared"]
+	if !ok {
+		t.Fatal("missing shared kb-shared")
+	}
+	if shared.Name != "Shared" {
+		t.Errorf("shared name = %q, want Shared", shared.Name)
+	}
+	if shared.Metadata["writable"] != false || shared.Metadata["shared_readonly"] != true {
+		t.Errorf("kb-shared metadata = %+v", shared.Metadata)
+	}
+	if shared.Metadata["base_type"] != "共享知识库" || shared.Metadata["role_type"] != "普通成员" {
+		t.Errorf("kb-shared role/base metadata = %+v", shared.Metadata)
 	}
 }
 

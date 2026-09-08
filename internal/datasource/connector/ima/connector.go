@@ -27,9 +27,9 @@ func NewConnector() *Connector { return &Connector{} }
 func (c *Connector) Type() string { return types.ConnectorTypeIMA }
 
 // Validate verifies the credentials by calling get_addable_knowledge_base_list
-// — the endpoint most likely to succeed even when the token has zero KBs, and
-// the same one ListResources uses. It returns 110030 (无权限) when the token
-// itself is invalid, which client.callAPI already maps to ErrInvalidCredentials.
+// — a cheap probe that returns 110030 (无权限) when the token itself is
+// invalid (client.callAPI maps that to ErrInvalidCredentials). ListResources
+// still merges this with search_knowledge_base so shared read-only KBs appear.
 func (c *Connector) Validate(ctx context.Context, config *types.DataSourceConfig) error {
 	cfg, err := parseIMAConfig(config)
 	if err != nil {
@@ -51,15 +51,22 @@ func (c *Connector) ResolveResourceAncestors(
 	return []string{}, nil
 }
 
-// ListResources returns the flat list of knowledge bases the token can read.
+// ListResources returns the flat list of knowledge bases the token can sync.
 // parentID is honoured only for the "no children" contract — see the note on
 // Connector.ListResources in internal/datasource/connector.go.
 //
-// Primary source is get_addable_knowledge_base_list, which returns the KBs the
-// current OpenAPI credential has permission to operate on. When that endpoint
-// returns an empty list (e.g. a legacy tenant only exposes read scopes) we
-// fall back to search_knowledge_base with an empty query so users still see
-// something to pick.
+// Sync only needs read access, so we merge two IMA list endpoints and dedupe
+// by id:
+//
+//   - get_addable_knowledge_base_list — KBs the credential may write to
+//   - search_knowledge_base("")      — every KB visible to the credential,
+//     including shared libraries that are read-only for this token
+//
+// Metadata marks each entry with writable / shared_readonly so the picker can
+// distinguish owned vs shared bases. Search failures are non-fatal when the
+// addable list already has entries (search has been observed empty/flaky on
+// some tenants); if both sides are empty after a search error, that error is
+// returned.
 func (c *Connector) ListResources(
 	ctx context.Context, config *types.DataSourceConfig, parentID string,
 ) ([]types.Resource, error) {
@@ -74,45 +81,111 @@ func (c *Connector) ListResources(
 	cli := newClient(cfg)
 
 	type kbLite struct {
-		ID       string
-		Name     string
-		CoverURL string
+		ID          string
+		Name        string
+		CoverURL    string
+		Description string
+		Creator     string
+		RoleType    string
+		BaseType    string
+		Writable    bool
 	}
-	var bases []kbLite
+	byID := map[string]*kbLite{}
+
+	merge := func(b kbLite) {
+		id := strings.TrimSpace(b.ID)
+		if id == "" {
+			return
+		}
+		b.ID = id
+		if existing, ok := byID[id]; ok {
+			if existing.Name == "" && b.Name != "" {
+				existing.Name = b.Name
+			}
+			if existing.CoverURL == "" && b.CoverURL != "" {
+				existing.CoverURL = b.CoverURL
+			}
+			if existing.Description == "" && b.Description != "" {
+				existing.Description = b.Description
+			}
+			if existing.Creator == "" && b.Creator != "" {
+				existing.Creator = b.Creator
+			}
+			if existing.RoleType == "" && b.RoleType != "" {
+				existing.RoleType = b.RoleType
+			}
+			if existing.BaseType == "" && b.BaseType != "" {
+				existing.BaseType = b.BaseType
+			}
+			if b.Writable {
+				existing.Writable = true
+			}
+			return
+		}
+		cp := b
+		byID[id] = &cp
+	}
 
 	cursor := ""
+	addableCount := 0
 	for {
 		resp, err := cli.GetAddableKnowledgeBaseList(ctx, cursor, defaultPageSize)
 		if err != nil {
 			return nil, fmt.Errorf("get_addable_knowledge_base_list: %w", err)
 		}
 		for _, b := range resp.AddableKnowledgeBaseList {
-			bases = append(bases, kbLite{ID: b.ID, Name: b.Name})
+			merge(kbLite{ID: b.ID, Name: b.Name, Writable: true})
+			addableCount++
 		}
 		if resp.IsEnd || resp.NextCursor == "" {
 			break
 		}
 		cursor = resp.NextCursor
 	}
-	logger.Infof(ctx, "[IMA] get_addable_knowledge_base_list returned %d knowledge bases", len(bases))
+	logger.Infof(ctx, "[IMA] get_addable_knowledge_base_list returned %d knowledge bases", addableCount)
 
-	if len(bases) == 0 {
-		cursor = ""
-		for {
-			resp, err := cli.SearchKnowledgeBase(ctx, "", cursor, searchPageSize)
-			if err != nil {
-				return nil, fmt.Errorf("search_knowledge_base fallback: %w", err)
-			}
-			for _, b := range resp.InfoList {
-				bases = append(bases, kbLite(b))
-			}
-			if resp.IsEnd || resp.NextCursor == "" {
-				break
-			}
-			cursor = resp.NextCursor
+	cursor = ""
+	searchCount := 0
+	var searchErr error
+	for {
+		resp, err := cli.SearchKnowledgeBase(ctx, "", cursor, searchPageSize)
+		if err != nil {
+			searchErr = err
+			break
 		}
-		logger.Infof(ctx, "[IMA] search_knowledge_base fallback returned %d knowledge bases", len(bases))
+		for _, b := range resp.InfoList {
+			merge(kbLite{
+				ID:          b.ID,
+				Name:        b.Name,
+				CoverURL:    b.CoverURL,
+				Description: b.Description,
+				Creator:     b.Creator,
+				RoleType:    b.RoleType,
+				BaseType:    b.BaseType,
+			})
+			searchCount++
+		}
+		if resp.IsEnd || resp.NextCursor == "" {
+			break
+		}
+		cursor = resp.NextCursor
 	}
+	if searchErr != nil {
+		if len(byID) == 0 {
+			return nil, fmt.Errorf("search_knowledge_base: %w", searchErr)
+		}
+		logger.Warnf(ctx, "[IMA] search_knowledge_base failed after addable list succeeded (continuing with %d bases): %v",
+			len(byID), searchErr)
+	} else {
+		logger.Infof(ctx, "[IMA] search_knowledge_base returned %d knowledge bases (merged unique=%d)",
+			searchCount, len(byID))
+	}
+
+	bases := make([]kbLite, 0, len(byID))
+	for _, b := range byID {
+		bases = append(bases, *b)
+	}
+	sort.Slice(bases, func(i, j int) bool { return bases[i].ID < bases[j].ID })
 
 	ids := make([]string, 0, len(bases))
 	for _, b := range bases {
@@ -136,26 +209,43 @@ func (c *Connector) ListResources(
 
 	out := make([]types.Resource, 0, len(bases))
 	for _, b := range bases {
-		desc := ""
+		desc := b.Description
 		coverURL := b.CoverURL
+		name := b.Name
 		if d, ok := details[b.ID]; ok {
-			desc = d.Description
+			if desc == "" {
+				desc = d.Description
+			}
 			if coverURL == "" {
 				coverURL = d.CoverURL
 			}
+			if name == "" {
+				name = d.Name
+			}
+		}
+		meta := map[string]interface{}{
+			"cover_url":       coverURL,
+			"writable":        b.Writable,
+			"shared_readonly": !b.Writable,
+		}
+		if b.RoleType != "" {
+			meta["role_type"] = b.RoleType
+		}
+		if b.BaseType != "" {
+			meta["base_type"] = b.BaseType
+		}
+		if b.Creator != "" {
+			meta["creator"] = b.Creator
 		}
 		out = append(out, types.Resource{
 			ExternalID:  b.ID,
-			Name:        b.Name,
+			Name:        name,
 			Type:        "knowledge_base",
 			Description: desc,
 			URL:         cfg.GetBaseURL(),
-			Metadata: map[string]interface{}{
-				"cover_url": coverURL,
-			},
+			Metadata:    meta,
 		})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ExternalID < out[j].ExternalID })
 	logger.Infof(ctx, "[IMA] ListResources returning %d knowledge bases to UI", len(out))
 	return out, nil
 }

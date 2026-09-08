@@ -122,11 +122,76 @@ type knowledgeBaseInfo struct {
 	RecommendedQuestions []string `json:"recommended_questions"`
 }
 
-// searchedKnowledgeBaseInfo — search_knowledge_base returns fewer fields.
+// searchedKnowledgeBaseInfo — search_knowledge_base list item.
+//
+// Production IMA returns kb_id / kb_name (plus role/base metadata). Older docs
+// and our fake server historically used id / name; UnmarshalJSON accepts both.
 type searchedKnowledgeBaseInfo struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	CoverURL string `json:"cover_url"`
+	ID          string
+	Name        string
+	CoverURL    string
+	Description string
+	Creator     string
+	RoleType    string // e.g. 创建者 / 管理员 / 普通成员
+	BaseType    string // e.g. 个人知识库 / 共享知识库
+}
+
+// UnmarshalJSON accepts both the live wire shape (kb_id/kb_name) and the
+// documented/legacy shape (id/name).
+func (s *searchedKnowledgeBaseInfo) UnmarshalJSON(data []byte) error {
+	var aux struct {
+		ID          string `json:"id"`
+		KBID        string `json:"kb_id"`
+		Name        string `json:"name"`
+		KBName      string `json:"kb_name"`
+		CoverURL    string `json:"cover_url"`
+		Description string `json:"description"`
+		Creator     string `json:"creator"`
+		RoleType    string `json:"role_type"`
+		BaseType    string `json:"base_type"`
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	s.ID = strings.TrimSpace(firstNonEmpty(aux.KBID, aux.ID))
+	s.Name = firstNonEmpty(aux.KBName, aux.Name)
+	s.CoverURL = aux.CoverURL
+	s.Description = aux.Description
+	s.Creator = aux.Creator
+	s.RoleType = aux.RoleType
+	s.BaseType = aux.BaseType
+	return nil
+}
+
+// MarshalJSON emits the production wire shape so fakes and round-trips match
+// what IMA actually returns.
+func (s searchedKnowledgeBaseInfo) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		KBID        string `json:"kb_id"`
+		KBName      string `json:"kb_name"`
+		CoverURL    string `json:"cover_url,omitempty"`
+		Description string `json:"description,omitempty"`
+		Creator     string `json:"creator,omitempty"`
+		RoleType    string `json:"role_type,omitempty"`
+		BaseType    string `json:"base_type,omitempty"`
+	}{
+		KBID:        s.ID,
+		KBName:      s.Name,
+		CoverURL:    s.CoverURL,
+		Description: s.Description,
+		Creator:     s.Creator,
+		RoleType:    s.RoleType,
+		BaseType:    s.BaseType,
+	})
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // searchKnowledgeBaseResp — search_knowledge_base response.
