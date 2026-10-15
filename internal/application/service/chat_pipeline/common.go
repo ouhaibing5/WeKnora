@@ -21,13 +21,13 @@ var regThinkTags = regexp.MustCompile(`(?s)<think>.*?</think>`)
 const retrievedImageOutputRequirement = `
 
 ## Retrieved Image Output Requirement
-The retrieved context for this turn contains Markdown images. Images attached to retrieved passages should be treated as relevant by default.
-- Unless the user explicitly requests text-only output, or every retrieved image is clearly unrelated to the answer, the final answer MUST include at least one relevant Markdown image copied from the retrieved context.
-- Copy the complete Markdown image syntax and its URL verbatim. Never invent, shorten, normalize, or replace the URL.
+The retrieved context for this turn contains Markdown images. Relevance is NOT implied by retrieval: judge each image against the user's question.
+- Include an image ONLY when it directly and specifically supports the part of the answer where it appears (e.g. it depicts the exact subject the user asked about).
+- If no retrieved image is clearly relevant to the answer, include NO images — a text-only answer is correct and preferred over forcing an unrelated one. Never include decorative, logo, header/footer, or UI-screenshot images.
+- When you do include a relevant image, copy the complete Markdown image syntax and its URL verbatim. Never invent, shorten, normalize, or replace the URL.
 - Use ASCII half-width parentheses in image Markdown exactly as ![alt](url). Never use full-width （ or ）.
-- Place each image immediately after the paragraph it supports, rather than collecting images at the end.
-- When multiple retrieved images support different sections of a multi-section answer, include them in their corresponding sections instead of stopping after the first image.
-- Before finishing, silently verify that the answer contains a Markdown image whenever this requirement applies.`
+- Place each included image immediately after the paragraph it supports, rather than collecting images at the end; when several are each relevant to different sections, include them in their corresponding sections.
+- Before finishing, verify every included image is directly relevant and remove any that is not, even if that leaves the answer with no images.`
 
 func appendRetrievedImageOutputRequirement(systemPrompt, renderedContexts string) string {
 	if !searchutil.MarkdownImageRegex.MatchString(renderedContexts) {

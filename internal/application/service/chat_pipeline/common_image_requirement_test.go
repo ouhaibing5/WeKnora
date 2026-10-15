@@ -13,13 +13,24 @@ func TestAppendRetrievedImageOutputRequirement(t *testing.T) {
 	)
 	for _, required := range []string{
 		base,
-		"MUST include at least one relevant Markdown image",
-		"Copy the complete Markdown image syntax and its URL verbatim",
+		"Include an image ONLY when it directly and specifically supports",
+		"include NO images",
+		"copy the complete Markdown image syntax and its URL verbatim",
 		"ASCII half-width parentheses",
 		"immediately after the paragraph it supports",
 	} {
 		if !strings.Contains(withImage, required) {
 			t.Fatalf("expected %q in dynamic image requirement:\n%s", required, withImage)
+		}
+	}
+
+	// Relevance-gated: the old "must include at least one" mandate must be gone.
+	for _, forbidden := range []string{
+		"MUST include at least one",
+		"relevant by default",
+	} {
+		if strings.Contains(withImage, forbidden) {
+			t.Fatalf("old image mandate %q should be removed:\n%s", forbidden, withImage)
 		}
 	}
 

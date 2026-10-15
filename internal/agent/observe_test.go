@@ -242,8 +242,9 @@ func TestAppendToolResults_AddsDynamicImageRequirementToCustomSystemPrompt(t *te
 	assert.Contains(t, out[3].Content, "![流程图](resource://AbCdEfGhIjKlMnOpQrStUv)")
 	assert.Equal(t, "user", out[4].Role)
 	assert.Contains(t, out[4].Content, agentRetrievedImageRequirementMarker)
-	assert.Contains(t, out[4].Content, "MUST include at least one relevant Markdown image")
+	assert.Contains(t, out[4].Content, "Include an image ONLY when it directly and specifically supports")
 	assert.Contains(t, out[4].Content, "ASCII half-width parentheses")
+	assert.NotContains(t, out[4].Content, "MUST include at least one")
 
 	// A later image-bearing step must not duplicate the requirement.
 	out = engine.appendToolResults(out, step)
