@@ -10,7 +10,6 @@ import (
 	"github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
-	"github.com/Tencent/WeKnora/internal/storageurl"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
@@ -27,6 +26,7 @@ import (
 // @Param        session_id     path      string  true   "会话ID"
 // @Param        message_id     query     string  true   "消息ID"
 // @Param        resource_urls  query     string  false  "文件引用形式，public 返回可加载直链"  Enums(handle, public)  default(handle)
+// @Param        wiki_links     query     string  false  "Wiki 链接形式，text 返回纯中文标题（去掉 [[slug|标题]] 标记）"  Enums(link, text)  default(link)
 // @Success      200            {object}  map[string]interface{}  "流式响应"
 // @Failure      404         {object}  errors.AppError         "会话或消息不存在"
 // @Security     Bearer
@@ -333,7 +333,7 @@ func (h *Handler) handleAgentEventsForSSE(
 	sessionID, assistantMessageID, requestID string,
 	eventBus *event.EventBus,
 	waitForTitle bool,
-	resourceRewriter *storageurl.StreamRewriter,
+	resourceRewriter *contentStreamRewriter,
 ) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()

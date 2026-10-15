@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"time"
 
 	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
@@ -13,6 +14,23 @@ import (
 	"github.com/Tencent/WeKnora/internal/searchutil"
 	"github.com/Tencent/WeKnora/internal/types"
 )
+
+// wikiLinkRegex detects a wiki link ([[slug]] or [[slug|title]]) in a tool
+// result, so the final-answer prompt can ask the model to preserve the exact
+// [[slug|title]] form instead of echoing a bare, romanized slug.
+var wikiLinkRegex = regexp.MustCompile(`\[\[[^\]]+\]\]`)
+
+// finalAnswerWikiRequirement tells the model to reuse the exact [[slug|title]]
+// wiki links that appear in the tool results, so a cited page keeps its
+// human-readable title instead of degrading to a bare, romanized [[slug]]. It is
+// added only when the tool results actually contain wiki links.
+func finalAnswerWikiRequirement(hasWikiLinks bool) string {
+	if !hasWikiLinks {
+		return ""
+	}
+	return `
+Wiki links: The tool results reference wiki pages using the form [[slug|title]] (often inside a <link> tag). Whenever your answer mentions such a page, reuse that EXACT [[slug|title]] text so the reference keeps its human-readable title. Never write a bare [[slug]] without the |title, and never invent a slug that does not appear in the tool results.`
+}
 
 func finalAnswerImageRequirement(hasRetrievedImage bool) string {
 	if !hasRetrievedImage {
@@ -52,6 +70,7 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 	// Add all tool call results as context
 	toolResultCount := 0
 	hasRetrievedImage := false
+	hasWikiLinks := false
 	for stepIdx, step := range state.RoundSteps {
 		for toolIdx, toolCall := range step.ToolCalls {
 			toolResultCount++
@@ -59,6 +78,9 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 				hasRetrievedImage = true
 			}
 			modelOutput := e.modelContext.ModelToolResultForTool(toolCall.Name, toolCall.Result)
+			if wikiLinkRegex.MatchString(modelOutput) {
+				hasWikiLinks = true
+			}
 			messages = append(messages, chat.Message{
 				Role:    "user",
 				Content: fmt.Sprintf("Tool %s returned: %s", toolCall.Name, modelOutput),
@@ -72,6 +94,7 @@ func (e *AgentEngine) streamFinalAnswerToEventBus(
 		len(messages), toolResultCount)
 
 	imageRequirement := finalAnswerImageRequirement(hasRetrievedImage)
+	wikiRequirement := finalAnswerWikiRequirement(hasWikiLinks)
 
 	// Add final answer prompt
 	finalPrompt := fmt.Sprintf(`Based on the above tool call results, generate a complete answer for the user's question.
@@ -83,9 +106,9 @@ Requirements:
 2. Organize the answer in a structured format
 3. If information is insufficient, honestly state so
 4. IMPORTANT: Respond in the same language as the user's question
-%s
+%s%s
 
-Now generate the final answer:`, query, imageRequirement)
+Now generate the final answer:`, query, imageRequirement, wikiRequirement)
 
 	messages = append(messages, chat.Message{
 		Role:    "user",

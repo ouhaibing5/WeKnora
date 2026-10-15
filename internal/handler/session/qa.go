@@ -17,7 +17,6 @@ import (
 	"github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
-	"github.com/Tencent/WeKnora/internal/storageurl"
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
@@ -60,10 +59,12 @@ type qaRequestContext struct {
 	attachmentIDs         []string                 // Pre-uploaded session-scoped document IDs, resolved after SSE starts
 	attachmentMetas       types.MessageAttachments // Metadata-only view of attachmentIDs for the persisted user message
 	suggestionAttribution *types.SuggestionAttribution
-	// resourceRewriter turns internal storage references in the outbound stream
-	// into directly loadable URLs when the caller asks for `resource_urls=public`.
-	// Disabled (a pass-through) in the default handle mode.
-	resourceRewriter *storageurl.StreamRewriter
+	// resourceRewriter bundles the outbound content rewriters for this request:
+	// it turns internal storage references into directly loadable URLs when the
+	// caller asks for `resource_urls=public`, and flattens wiki links to their
+	// display text when the caller asks for `wiki_links=text`. Both are
+	// pass-throughs in their default modes.
+	resourceRewriter *contentStreamRewriter
 
 	// Snapshot of the request fields needed to persist the input-bar state
 	// for session restoration. Kept verbatim from the request so we record
@@ -702,6 +703,7 @@ func (h *Handler) setupSSEStream(reqCtx *qaRequestContext, generateTitle bool) *
 // @Produce      json
 // @Param        request  body      SearchKnowledgeRequest  true  "搜索请求"
 // @Param        resource_urls  query     string  false  "文件引用形式，public 返回可加载直链"  Enums(handle, public)  default(handle)
+// @Param        wiki_links     query     string  false  "Wiki 链接形式，text 返回纯中文标题（去掉 [[slug|标题]] 标记）"  Enums(link, text)  default(link)
 // @Success      200      {object}  map[string]interface{}  "搜索结果"
 // @Failure      400      {object}  errors.AppError         "请求参数错误"
 // @Security     Bearer
@@ -731,6 +733,15 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 	rewriter, err := h.resolveResourceRewriter(c)
 	if err != nil {
 		logger.Warnf(ctx, "Rejected resource URL mode: %v", err)
+		_ = c.Error(err)
+		return
+	}
+
+	// Likewise resolve the wiki-link representation up front so an invalid
+	// `wiki_links` value is a clean 400 rather than a surprise in the payload.
+	wikiRewriter, err := h.resolveWikiRewriter(c)
+	if err != nil {
+		logger.Warnf(ctx, "Rejected wiki link mode: %v", err)
 		_ = c.Error(err)
 		return
 	}
@@ -790,7 +801,7 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 	logger.Infof(ctx, "Knowledge search completed, found %d results", len(searchResults))
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    rewriter.CopyReferences(ctx, searchResults),
+		"data":    wikiRewriter.CopyReferences(ctx, rewriter.CopyReferences(ctx, searchResults)),
 	})
 }
 
@@ -803,6 +814,7 @@ func (h *Handler) SearchKnowledge(c *gin.Context) {
 // @Param        session_id  path      string                   true  "会话ID"
 // @Param        request     body      CreateKnowledgeQARequest true  "问答请求"
 // @Param        resource_urls  query     string  false  "文件引用形式，public 返回可加载直链"  Enums(handle, public)  default(handle)
+// @Param        wiki_links     query     string  false  "Wiki 链接形式，text 返回纯中文标题（去掉 [[slug|标题]] 标记）"  Enums(link, text)  default(link)
 // @Success      200         {object}  map[string]interface{}   "问答结果（SSE流）"
 // @Failure      400         {object}  errors.AppError          "请求参数错误"
 // @Security     Bearer
@@ -829,6 +841,7 @@ func (h *Handler) KnowledgeQA(c *gin.Context) {
 // @Param        session_id  path      string                   true  "会话ID"
 // @Param        request     body      CreateKnowledgeQARequest true  "问答请求"
 // @Param        resource_urls  query     string  false  "文件引用形式，public 返回可加载直链"  Enums(handle, public)  default(handle)
+// @Param        wiki_links     query     string  false  "Wiki 链接形式，text 返回纯中文标题（去掉 [[slug|标题]] 标记）"  Enums(link, text)  default(link)
 // @Success      200         {object}  map[string]interface{}   "问答结果（SSE流）"
 // @Failure      400         {object}  errors.AppError          "请求参数错误"
 // @Security     Bearer

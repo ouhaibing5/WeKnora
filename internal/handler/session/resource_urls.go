@@ -10,6 +10,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/storageurl"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/Tencent/WeKnora/internal/wikilink"
 	"github.com/gin-gonic/gin"
 )
 
@@ -38,16 +39,52 @@ func (h *Handler) resolveResourceRewriter(c *gin.Context) (*storageurl.Rewriter,
 	return storageurl.NewRequestRewriter(ctx, mode, h.fileService, h.storageResolver), nil
 }
 
-// resolveStreamRewriter is resolveResourceRewriter plus the holdback buffer an
-// SSE response needs, because a storage reference can straddle two deltas. It
-// must be called before any SSE header is written so an invalid value is still
-// reportable as a normal JSON error.
-func (h *Handler) resolveStreamRewriter(c *gin.Context) (*storageurl.StreamRewriter, error) {
-	rewriter, err := h.resolveResourceRewriter(c)
+// contentStreamRewriter bundles the per-response content rewriters for an SSE
+// stream: storage-reference resolution (`resource_urls`) and wiki-link
+// flattening (`wiki_links`). Each is independently enabled by its own query
+// parameter, so the bundle is a pass-through when neither is requested.
+type contentStreamRewriter struct {
+	storage *storageurl.StreamRewriter
+	wiki    *wikilink.StreamRewriter
+}
+
+// Enabled reports whether either rewriter will alter content. Both fields are
+// nil-safe, so a partially populated bundle degrades to a pass-through.
+func (r *contentStreamRewriter) Enabled() bool {
+	return r != nil && (r.storage.Enabled() || r.wiki.Enabled())
+}
+
+// resolveWikiRewriter builds the wiki-link rewriter for one response from the
+// request's `wiki_links` parameter, falling back to the deployment default. The
+// returned error is already an AppError the caller can hand to c.Error.
+//
+// In the default link mode the returned rewriter is disabled, so responses keep
+// their `[[slug|title]]` markup exactly as before.
+func (h *Handler) resolveWikiRewriter(c *gin.Context) (*wikilink.Rewriter, error) {
+	mode, err := wikilink.ResolveMode(c.Request.Context(), c.Query(wikilink.QueryParam))
+	if err != nil {
+		return nil, errors.NewBadRequestError(err.Error())
+	}
+	return wikilink.NewRewriter(mode), nil
+}
+
+// resolveStreamRewriter bundles the storage and wiki rewriters plus the holdback
+// buffers an SSE response needs, because a storage reference or a wiki link can
+// straddle two deltas. It must be called before any SSE header is written so an
+// invalid value is still reportable as a normal JSON error.
+func (h *Handler) resolveStreamRewriter(c *gin.Context) (*contentStreamRewriter, error) {
+	storage, err := h.resolveResourceRewriter(c)
 	if err != nil {
 		return nil, err
 	}
-	return storageurl.NewStreamRewriter(rewriter), nil
+	wiki, err := h.resolveWikiRewriter(c)
+	if err != nil {
+		return nil, err
+	}
+	return &contentStreamRewriter{
+		storage: storageurl.NewStreamRewriter(storage),
+		wiki:    wikilink.NewStreamRewriter(wiki),
+	}, nil
 }
 
 // deltaResponseTypes are the SSE events whose Content is an incremental chunk
@@ -81,28 +118,48 @@ func parseHoldbackKey(key string) (types.ResponseType, string) {
 	return types.ResponseType(responseType), eventID
 }
 
-// buildStreamResponseFor builds the SSE payload for evt and, in public mode,
-// replaces storage references with URLs the client can load directly.
+// buildStreamResponseFor builds the SSE payload for evt and applies the active
+// content rewriters: in public mode it replaces storage references with URLs the
+// client can load directly, and in text mode it flattens wiki links to their
+// display text.
 func buildStreamResponseFor(
 	ctx context.Context,
 	evt interfaces.StreamEvent,
 	requestID string,
-	rewriter *storageurl.StreamRewriter,
+	rewriter *contentStreamRewriter,
 ) *types.StreamResponse {
 	response := buildStreamResponse(evt, requestID)
 	if !rewriter.Enabled() {
 		return response
 	}
 
-	response.KnowledgeReferences = rewriter.Rewriter().CopyReferences(ctx, response.KnowledgeReferences)
-	response.Data = rewriter.Rewriter().CopyData(ctx, response.Data)
+	if rewriter.storage.Enabled() {
+		response.KnowledgeReferences = rewriter.storage.Rewriter().CopyReferences(ctx, response.KnowledgeReferences)
+		response.Data = rewriter.storage.Rewriter().CopyData(ctx, response.Data)
+	}
+	if rewriter.wiki.Enabled() {
+		response.KnowledgeReferences = rewriter.wiki.Rewriter().CopyReferences(ctx, response.KnowledgeReferences)
+	}
+
 	if deltaResponseTypes[evt.Type] {
-		// The rewritten Data rides along with the held tail so a late release
-		// carries the same metadata as the event it was cut from.
-		response.Content = rewriter.Push(
-			ctx, holdbackKey(evt.Type, evt.ID), response.Content, evt.Done, response.Data)
+		key := holdbackKey(evt.Type, evt.ID)
+		content := response.Content
+		if rewriter.storage.Enabled() {
+			// The rewritten Data rides along with the held tail so a late
+			// release carries the same metadata as the event it was cut from.
+			content = rewriter.storage.Push(ctx, key, content, evt.Done, response.Data)
+		}
+		if rewriter.wiki.Enabled() {
+			content = rewriter.wiki.Push(ctx, key, content, evt.Done, response.Data)
+		}
+		response.Content = content
 	} else {
-		response.Content = rewriter.Rewriter().String(ctx, response.Content)
+		if rewriter.storage.Enabled() {
+			response.Content = rewriter.storage.Rewriter().String(ctx, response.Content)
+		}
+		if rewriter.wiki.Enabled() {
+			response.Content = rewriter.wiki.Rewriter().String(ctx, response.Content)
+		}
 	}
 	return response
 }
@@ -115,7 +172,7 @@ func emitStreamEvent(
 	c *gin.Context,
 	evt interfaces.StreamEvent,
 	requestID string,
-	rewriter *storageurl.StreamRewriter,
+	rewriter *contentStreamRewriter,
 ) {
 	response := buildStreamResponseFor(ctx, evt, requestID, rewriter)
 	if terminalResponseTypes[evt.Type] {
@@ -135,26 +192,47 @@ func flushHeldStreamContent(
 	ctx context.Context,
 	c *gin.Context,
 	requestID string,
-	rewriter *storageurl.StreamRewriter,
+	rewriter *contentStreamRewriter,
 ) {
-	held := rewriter.FlushAll(ctx)
-	if len(held) == 0 || c.Request.Context().Err() != nil {
+	if !rewriter.Enabled() || c.Request.Context().Err() != nil {
 		return
 	}
-	for key, fragment := range held {
-		if fragment.Content == "" {
-			continue
-		}
-		responseType, eventID := parseHoldbackKey(key)
-		logger.Debugf(ctx, "Flushing held stream fragment, type: %s, event: %s", responseType, eventID)
-		c.SSEvent("message", &types.StreamResponse{
-			ID:           requestID,
-			ResponseType: responseType,
-			Content:      fragment.Content,
-			Data:         heldFragmentData(fragment.Meta, eventID),
-		})
-		c.Writer.Flush()
+	// The wiki buffer holds content the storage buffer already emitted, so its
+	// tail is chronologically older; release it first, then the storage tail
+	// flattened through wiki, to preserve ordering when both modes are active.
+	for key, fragment := range rewriter.wiki.FlushAll(ctx) {
+		emitHeldFragment(ctx, c, requestID, key, fragment.Content, fragment.Meta)
 	}
+	for key, fragment := range rewriter.storage.FlushAll(ctx) {
+		content := fragment.Content
+		if rewriter.wiki.Enabled() {
+			content = rewriter.wiki.Rewriter().String(ctx, content)
+		}
+		emitHeldFragment(ctx, c, requestID, key, content, fragment.Meta)
+	}
+}
+
+// emitHeldFragment writes one released holdback tail as the event type it was
+// cut from, carrying the metadata of that event. If the client has already gone
+// there is nobody left to receive it, but callers gate on that before flushing.
+func emitHeldFragment(
+	ctx context.Context,
+	c *gin.Context,
+	requestID, key, content string,
+	meta interface{},
+) {
+	if content == "" {
+		return
+	}
+	responseType, eventID := parseHoldbackKey(key)
+	logger.Debugf(ctx, "Flushing held stream fragment, type: %s, event: %s", responseType, eventID)
+	c.SSEvent("message", &types.StreamResponse{
+		ID:           requestID,
+		ResponseType: responseType,
+		Content:      content,
+		Data:         heldFragmentData(meta, eventID),
+	})
+	c.Writer.Flush()
 }
 
 // heldFragmentData rebuilds the metadata for a released tail from the event it

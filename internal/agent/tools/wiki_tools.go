@@ -467,7 +467,8 @@ func NewWikiReadPageTool(
 			ToolWikiReadPage,
 			`Read one or more wiki pages by their slugs. Returns the full markdown content, metadata, and links.
 Use this to read specific wiki pages when you know their slug (e.g. "entity/acme-corp", "concept/rag").
-Knowledge-base routing is automatic. Known link/search provenance is preferred; otherwise every wiki knowledge base in scope is checked and ambiguous matches are returned.`,
+Knowledge-base routing is automatic. Known link/search provenance is preferred; otherwise every wiki knowledge base in scope is checked and ambiguous matches are returned.
+When you mention a page you read in your final answer, cite it with its exact [[slug|title]] link (from the <link> field in the result) so the reference keeps its human-readable title; never write a bare [[slug]].`,
 			json.RawMessage(`{
   "type": "object",
   "properties": {
@@ -780,7 +781,8 @@ Examples:
 - Prefix matching: "^entity/.*" (finds all entities)
 - Plain text: "engine" (matches anywhere in title/content/slug/summary)
 IMPORTANT — JSON escaping: every backslash in a regex MUST be written as \\ inside the JSON tool arguments (e.g. to search for literal "C++" write "C\\+\\+", NOT "C\+\+"; for "\d+" write "\\d+"). Plain "\+" / "\d" etc. are invalid JSON escapes and will fail to parse.
-Use this to find relevant wiki pages when you don't know the exact slug.`,
+Use this to find relevant wiki pages when you don't know the exact slug.
+Each result carries a [[slug|title]] link; when you mention a page in your final answer, reuse that exact form so it keeps its human-readable title, never a bare [[slug]].`,
 			json.RawMessage(`{
   "type": "object",
   "properties": {

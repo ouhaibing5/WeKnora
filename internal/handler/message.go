@@ -16,6 +16,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
+	"github.com/Tencent/WeKnora/internal/wikilink"
 )
 
 // MessageHandler handles HTTP requests related to messages within chat sessions
@@ -65,6 +66,19 @@ func (h *MessageHandler) resolveResourceRewriter(c *gin.Context) (*storageurl.Re
 	return storageurl.NewRequestRewriter(ctx, mode, h.FileService, h.StorageResolver), nil
 }
 
+// resolveWikiRewriter builds the wiki-link rewriter for one response from the
+// request's `wiki_links` parameter, falling back to the deployment default. In
+// the default link mode the rewriter is disabled, so `[[slug|title]]` markup is
+// preserved for the web UI; `wiki_links=text` flattens it to the display title
+// for external integrators.
+func (h *MessageHandler) resolveWikiRewriter(c *gin.Context) (*wikilink.Rewriter, error) {
+	mode, err := wikilink.ResolveMode(c.Request.Context(), c.Query(wikilink.QueryParam))
+	if err != nil {
+		return nil, errors.NewBadRequestError(err.Error())
+	}
+	return wikilink.NewRewriter(mode), nil
+}
+
 // LoadMessages godoc
 // @Summary      加载消息历史
 // @Description  加载会话的消息历史，支持分页和时间筛选
@@ -75,6 +89,7 @@ func (h *MessageHandler) resolveResourceRewriter(c *gin.Context) (*storageurl.Re
 // @Param        limit          query     int     false  "返回数量"  default(20)
 // @Param        before_time    query     string  false  "在此时间之前的消息（RFC3339Nano格式）"
 // @Param        resource_urls  query     string  false  "文件引用形式，public 返回可加载直链"  Enums(handle, public)  default(handle)
+// @Param        wiki_links     query     string  false  "Wiki 链接形式，text 返回纯中文标题（去掉 [[slug|标题]] 标记）"  Enums(link, text)  default(link)
 // @Success      200            {object}  map[string]interface{}  "消息列表"
 // @Failure      400          {object}  errors.AppError         "请求参数错误"
 // @Security     Bearer
@@ -96,6 +111,13 @@ func (h *MessageHandler) LoadMessages(c *gin.Context) {
 	rewriter, err := h.resolveResourceRewriter(c)
 	if err != nil {
 		logger.Warnf(ctx, "Rejected resource URL mode: %v", err)
+		_ = c.Error(err)
+		return
+	}
+
+	wikiRewriter, err := h.resolveWikiRewriter(c)
+	if err != nil {
+		logger.Warnf(ctx, "Rejected wiki link mode: %v", err)
 		_ = c.Error(err)
 		return
 	}
@@ -133,7 +155,7 @@ func (h *MessageHandler) LoadMessages(c *gin.Context) {
 		)
 		c.JSON(http.StatusOK, gin.H{
 			"success": true,
-			"data":    rewriter.RewriteMessagesResponse(ctx, messages),
+			"data":    wikiRewriter.RewriteMessagesResponse(ctx, rewriter.RewriteMessagesResponse(ctx, messages)),
 		})
 		return
 	}
@@ -173,7 +195,7 @@ func (h *MessageHandler) LoadMessages(c *gin.Context) {
 	)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"data":    rewriter.RewriteMessagesResponse(ctx, messages),
+		"data":    wikiRewriter.RewriteMessagesResponse(ctx, rewriter.RewriteMessagesResponse(ctx, messages)),
 	})
 }
 

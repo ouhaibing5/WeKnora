@@ -16,6 +16,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/storageurl"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/Tencent/WeKnora/internal/wikilink"
 )
 
 const testResourceHandle = "resource://xifDo7NTSL300Lp1goVutw"
@@ -39,9 +40,19 @@ func (s *stubResourceFileService) GetFile(context.Context, string) (io.ReadClose
 	return nil, nil
 }
 
-func publicStreamRewriter() *storageurl.StreamRewriter {
-	return storageurl.NewStreamRewriter(storageurl.NewRequestRewriter(
-		context.Background(), storageurl.ModePublic, &stubResourceFileService{}, nil))
+func publicStreamRewriter() *contentStreamRewriter {
+	return &contentStreamRewriter{
+		storage: storageurl.NewStreamRewriter(storageurl.NewRequestRewriter(
+			context.Background(), storageurl.ModePublic, &stubResourceFileService{}, nil)),
+	}
+}
+
+// textWikiStreamRewriter flattens wiki links to their display text, with the
+// storage rewriter left in its default (disabled) handle mode.
+func textWikiStreamRewriter() *contentStreamRewriter {
+	return &contentStreamRewriter{
+		wiki: wikilink.NewStreamRewriter(wikilink.NewRewriter(wikilink.ModeText)),
+	}
 }
 
 func newTestGinContext(t *testing.T, query string) (*gin.Context, *httptest.ResponseRecorder) {
@@ -74,7 +85,7 @@ func TestResolveStreamRewriter_RejectsInvalidValue(t *testing.T) {
 
 // The default mode must not alter a payload at all.
 func TestBuildStreamResponseFor_DisabledPassesThrough(t *testing.T) {
-	rewriter := storageurl.NewStreamRewriter(storageurl.NewRewriter(nil, "TEST"))
+	rewriter := &contentStreamRewriter{storage: storageurl.NewStreamRewriter(storageurl.NewRewriter(nil, "TEST"))}
 	evt := interfaces.StreamEvent{
 		ID:      "answer-1",
 		Type:    types.ResponseTypeAnswer,
@@ -244,6 +255,39 @@ func TestHoldbackKeyRoundTrip(t *testing.T) {
 	responseType, eventID := parseHoldbackKey(holdbackKey(types.ResponseTypeThinking, "think-1"))
 	assert.Equal(t, types.ResponseTypeThinking, responseType)
 	assert.Equal(t, "think-1", eventID)
+}
+
+// wiki_links=text flattens [[slug|title]] in answer deltas to the display title,
+// holding back a link split across two chunks so it is never emitted broken.
+func TestBuildStreamResponseFor_FlattensWikiLinksAcrossDeltas(t *testing.T) {
+	rewriter := textWikiStreamRewriter()
+	ctx := context.Background()
+
+	first := buildStreamResponseFor(ctx, interfaces.StreamEvent{
+		ID:      "answer-1",
+		Type:    types.ResponseTypeAnswer,
+		Content: "见 [[entity/nian-jia",
+	}, "req-1", rewriter)
+	assert.Equal(t, "见 ", first.Content, "the incomplete wiki link must be held back")
+
+	second := buildStreamResponseFor(ctx, interfaces.StreamEvent{
+		ID:      "answer-1",
+		Type:    types.ResponseTypeAnswer,
+		Content: "|年假管理办法]] 完毕",
+	}, "req-1", rewriter)
+	assert.Equal(t, "年假管理办法 完毕", second.Content)
+}
+
+// The default link mode leaves wiki markup byte-identical so the web UI can still
+// render clickable cross-references.
+func TestBuildStreamResponseFor_KeepsWikiLinksInLinkMode(t *testing.T) {
+	rewriter := &contentStreamRewriter{wiki: wikilink.NewStreamRewriter(wikilink.NewRewriter(wikilink.ModeLink))}
+	response := buildStreamResponseFor(context.Background(), interfaces.StreamEvent{
+		ID:      "answer-1",
+		Type:    types.ResponseTypeAnswer,
+		Content: "见 [[entity/nian-jia|年假管理办法]]",
+	}, "req-1", rewriter)
+	assert.Equal(t, "见 [[entity/nian-jia|年假管理办法]]", response.Content)
 }
 
 func indexOf(haystack, needle string) int {
